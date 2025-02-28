@@ -1,0 +1,284 @@
+#include "DHT.h"
+#include <PubSubClient.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// กำหนดพินและชนิดของ DHT
+#define DHTPIN 4        // ใช้ GPIO 4 เชื่อมต่อกับ DHT22
+#define DHTTYPE DHT22   // กำหนดชนิดของเซ็นเซอร์เป็น DHT22
+
+DHT dht(DHTPIN, DHTTYPE); // สร้างอ็อบเจ็กต์ DHT
+
+// พินอื่น ๆ
+#define rain 13
+#define ldr 35
+#define objectSensorFront 32
+#define objectSensorBack 33
+
+// กำหนดพินสำหรับ L298N
+#define ENA 5
+#define IN1 19
+#define IN2 18
+
+// WiFi และ MQTT
+const char* ssid = "O.O";
+const char* password = "westxxrrr";
+const char* mqtt_server = "broker.hivemq.com";
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ตัวแปรเซ็นเซอร์
+int valueRain;
+int valueLDR;
+float humidity;
+float temperature;
+int objectValueFront;
+int objectValueBack;
+bool autoMode = true;
+
+// 🔴 **เพิ่มตัวแปร statusMessage เป็น global**
+String statusMessage = "UNKNOWN";
+
+unsigned long lastMillis = 0;
+
+void setup() {
+  Serial.begin(9600);
+
+  dht.begin();
+
+  pinMode(rain, INPUT);
+  pinMode(ldr, INPUT);
+  pinMode(objectSensorFront, INPUT);
+  pinMode(objectSensorBack, INPUT);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("WiFi connected");
+
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+}
+
+unsigned long lastSensorUpdate = 0; // เก็บเวลาส่งข้อมูลล่าสุด
+const unsigned long sensorInterval = 10000; // 30 นาที (1,800,000 ms)
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  if (autoMode) {
+    valueRain = digitalRead(rain);
+    valueLDR = digitalRead(ldr);
+    humidity = dht.readHumidity();
+    temperature = dht.readTemperature();
+    objectValueFront = digitalRead(objectSensorFront);
+    objectValueBack = digitalRead(objectSensorBack);
+
+    Serial.print("Rain=");
+    Serial.print(valueRain);
+    Serial.print(" | LDR=");
+    Serial.print(valueLDR);
+    Serial.print(" | Humidity=");
+    Serial.print(humidity);
+    Serial.print("% | Temperature=");
+    Serial.print(temperature);
+    Serial.print("°C | Object Front=");
+    Serial.print(objectValueFront);
+    Serial.print(" | Object Back=");
+    Serial.println(objectValueBack);
+
+      if (millis() - lastSensorUpdate >= sensorInterval) {
+      sendSensorData();
+      lastSensorUpdate = millis(); // อัปเดตเวลาส่งล่าสุด
+    }
+
+    if (valueRain == 0 || humidity > 70.0 || temperature < 22.0) {
+      Serial.println("Pulling clothes back.");
+      retractClothes();
+    } else if (valueRain == 1 && valueLDR == 0 && temperature > 26.0) {
+      Serial.println("Extending clothes.");
+      extendClothes();
+    } else if (valueRain == 1 && (valueLDR == 1 || temperature < 22.0)) {
+      Serial.println("Pulling clothes back.");
+      retractClothes();
+    }else  {
+    // โค้ดในโหมดแมนนวล
+    objectValueFront = digitalRead(objectSensorFront);
+    objectValueBack = digitalRead(objectSensorBack);
+    sendSensorData();  // ส่งข้อมูลเซ็นเซอร์ในโหมด Manual
+    sendClothesStatus();  
+
+    // if (millis() - lastMillis >= 1000) {
+    //   lastMillis = millis();
+    // }
+  }
+}
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  Serial.println(message);
+
+  if (String(topic) == "clothes/control") {
+    if (message == "0") {
+      retractClothes();
+    } else if (message == "1") {
+      extendClothes();
+    }
+  } else if (String(topic) == "clothes/mode") {
+    if (message == "Auto") {
+      autoMode = true;
+      Serial.println("Switched to Auto Mode");
+      client.publish("clothes/statusmode", "Auto"); // ส่งสถานะไปที่ MQTT
+    } else if (message == "Manual") {
+      autoMode = false;
+      Serial.println("Switched to Manual Mode");
+      stopMotor();
+      client.publish("clothes/statusmode", "Manual"); // ส่งสถานะไปที่ MQTT
+      sendSensorData();
+      sendClothesStatus();
+      delay(1000);
+    }
+  }
+
+
+}
+
+// ✅ **แก้ไขให้สามารถใช้ statusMessage ได้ถูกต้อง**
+void sendSensorData() {
+  
+
+  sendClothesStatus(); // อัปเดต statusMessage ก่อนส่งข้อมูล
+
+  // ✅ กำหนด payload สำหรับ MQTT
+  char payload[150];
+  snprintf(payload, sizeof(payload), 
+           "{\"temp\":%.2f,\"humi\":%.2f,\"status\":\"%s\"}", 
+           temperature, humidity, statusMessage.c_str());
+
+  // ✅ ส่งไปยังห้องที่เก็บลงฐานข้อมูล
+  client.publish("clothes/sensorData", payload);
+  Serial.println("Sensor data sent to MQTT (clothes/sensorData):");
+  Serial.println(payload);
+
+  // ✅ ส่งไปยังห้องสำหรับหน้าเว็บ
+  client.publish("clothes/webSensorData", payload);
+  Serial.println("Sensor data sent to MQTT (clothes/webSensorData):");
+  Serial.println(payload);
+
+  // ✅ ส่งข้อมูลไปยังฐานข้อมูลผ่าน HTTP
+  String serverUrl = "http://192.168.65.54/IoT_Clothes/Clothes.php?temp=" + 
+                      String(temperature) + "&humi=" + 
+                      String(humidity) + "&status=" + statusMessage;
+
+  HTTPClient http;
+  http.begin(serverUrl);
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode > 0) {
+    Serial.print("HTTP Response code: ");
+    Serial.println(httpResponseCode);
+  } else {
+    Serial.print("Error on HTTP request: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
+
+ }
+
+// ✅ **แก้ไข sendClothesStatus() ให้กำหนดค่า statusMessage**
+void sendClothesStatus() {
+  bool sent = false;
+
+  if (objectValueFront == 0) {
+    statusMessage = "open";
+    client.publish("clothes/status", statusMessage.c_str());
+    Serial.print("Clothes status sent: ");
+    Serial.println(statusMessage);
+    sent = true;
+  }
+
+  if (objectValueBack == 0) {
+    statusMessage = "close";
+    client.publish("clothes/status", statusMessage.c_str());
+    Serial.print("Clothes status sent: ");
+    Serial.println(statusMessage);
+    sent = true;
+  }
+
+  if (!sent) {
+    statusMessage = "UNKNOWN"; // ถ้าไม่มีเงื่อนไขไหนตรง ให้เป็น UNKNOWN
+  }
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP32TEST", "", "")) {
+      Serial.println("mqtt connected");
+      client.subscribe("clothes/control");
+      client.subscribe("clothes/mode");
+      client.subscribe("clothes/sensorData");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+ //ส่วนควบคุมการหมุนมอเตอร์
+int readBackSensor() {
+  return digitalRead(objectSensorBack);  // อ่านค่าจากเซ็นเซอร์ท้าย
+}
+
+int readFrontSensor() {
+  return digitalRead(objectSensorFront); // อ่านค่าจากเซ็นเซอร์หัว
+}
+
+void extendClothes() {
+  if (readFrontSensor() >= 1) {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    analogWrite(ENA, 250);
+  } else {
+    Serial.println("Object detected at the front: Cannot extend clothes.");
+    sendClothesStatus();
+    stopMotor();
+  }
+}
+
+void retractClothes() {
+  if (readBackSensor() >= 1) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, 250);
+  } else {
+    Serial.println("Object detected at the back: Cannot retract clothes.");
+    sendClothesStatus();
+    stopMotor();
+  }
+}
+
+void stopMotor() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, 0);
+  Serial.println("Motor stopped.");
+}
